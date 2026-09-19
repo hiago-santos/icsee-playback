@@ -1,0 +1,26 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "iCSee Playback",
+        "description": "Connect an iCSee/Xiongmai camera to browse and play SD-card recordings in the Media Browser.",
+        "data": {
+          "name": "Name",
+          "host": "IP address",
+          "port": "DVRIP port",
+          "username": "Username",
+          "password": "Password",
+          "channel": "Channel (0 = camera 1)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the camera. Check the IP and port 34567.",
+      "invalid_auth": "Invalid username or password.",
+      "unknown": "Unexpected error talking to the camera."
+    },
+    "abort": {
+      "already_configured": "This camera is already configured."
+    }
+  }
+}

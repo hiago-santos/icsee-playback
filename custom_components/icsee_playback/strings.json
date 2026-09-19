@@ -1,0 +1,26 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "iCSee Playback",
+        "description": "Conecte uma câmera iCSee/Xiongmai para listar e reproduzir as gravações do cartão no Media Browser.",
+        "data": {
+          "name": "Nome",
+          "host": "Endereço IP",
+          "port": "Porta DVRIP",
+          "username": "Usuário",
+          "password": "Senha",
+          "channel": "Canal (0 = câmera 1)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Não foi possível conectar na câmera. Confira IP e porta 34567.",
+      "invalid_auth": "Usuário ou senha incorretos.",
+      "unknown": "Erro inesperado ao falar com a câmera."
+    },
+    "abort": {
+      "already_configured": "Esta câmera já está configurada."
+    }
+  }
+}

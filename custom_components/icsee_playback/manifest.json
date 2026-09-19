@@ -1,0 +1,13 @@
+{
+  "domain": "icsee_playback",
+  "name": "iCSee Playback",
+  "codeowners": ["@hiago-santos"],
+  "config_flow": true,
+  "dependencies": ["ffmpeg", "http", "media_source"],
+  "documentation": "https://github.com/hiago-santos/icsee-playback",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/hiago-santos/icsee-playback/issues",
+  "requirements": [],
+  "version": "0.2.3"
+}

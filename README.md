@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="icon.png" alt="iCSee Playback" width="128" height="128">
+  <img src="https://raw.githubusercontent.com/hiago-santos/icsee-playback/main/icon.png" alt="iCSee Playback" width="128" height="128">
 </p>
 
 # iCSee Playback

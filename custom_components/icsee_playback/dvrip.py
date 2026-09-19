@@ -197,6 +197,31 @@ def _length_prefixed_to_annexb(data: bytes) -> bytes | None:
     return bytes(out)
 
 
+def annexb_has_keyframe(data: bytes, codec: str) -> bool:
+    """True once the Annex-B buffer includes an IDR/CRA (enough for one JPEG)."""
+    i = 0
+    n = len(data)
+    hevc = codec == "hevc"
+    while i + 3 < n:
+        if data[i : i + 4] == b"\x00\x00\x00\x01":
+            start = i + 4
+        elif data[i : i + 3] == b"\x00\x00\x01":
+            start = i + 3
+        else:
+            i += 1
+            continue
+        if start >= n:
+            break
+        nal = data[start]
+        if hevc:
+            if (nal >> 1) & 0x3F in (19, 20, 21):
+                return True
+        elif nal & 0x1F == 5:
+            return True
+        i = start + 1
+    return False
+
+
 class DVRIP:
     def __init__(self, ip, port=34567, timeout=15):
         self.ip = ip
@@ -391,7 +416,7 @@ class DVRIP:
             },
         }
 
-    def iter_file_stream(self, file_info):
+    def iter_file_stream(self, file_info, timeout=25):
         demuxer = FrameDemuxer()
         claim = self.parse_json(
             self.send_command(1424, self.playback_payload("Claim", file_info))
@@ -400,7 +425,7 @@ class DVRIP:
             raise RuntimeError("A câmera recusou o Claim de playback.")
 
         self.send_packet(1420, self.playback_payload("DownloadStart", file_info))
-        self.sock.settimeout(25)
+        self.sock.settimeout(timeout)
         json_seen = False
 
         try:
@@ -433,7 +458,7 @@ class DVRIP:
             except OSError:
                 pass
 
-    def iter_raw_download(self, file_info):
+    def iter_raw_download(self, file_info, timeout=12):
         """Download file bytes without H.264/HEVC demux (snapshots)."""
         claim = self.parse_json(
             self.send_command(1424, self.playback_payload("Claim", file_info))
@@ -442,7 +467,7 @@ class DVRIP:
             raise RuntimeError("A câmera recusou o Claim da foto.")
 
         self.send_packet(1420, self.playback_payload("DownloadStart", file_info))
-        self.sock.settimeout(12)
+        self.sock.settimeout(timeout)
         json_seen = False
         try:
             while True:

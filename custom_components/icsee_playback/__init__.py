@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import secrets
+import shutil
+from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -31,6 +33,12 @@ def _ensure_store(hass: HomeAssistant) -> None:
     hass.data[DOMAIN].setdefault("hls", {})
 
 
+def _purge_legacy_thumb_cache(hass: HomeAssistant) -> None:
+    folder = Path(hass.config.path(".storage", "icsee_playback_thumbs"))
+    if folder.is_dir():
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 async def async_setup(hass: HomeAssistant, _config: dict) -> bool:
     """YAML setup is not supported."""
     _ensure_store(hass)
@@ -40,6 +48,7 @@ async def async_setup(hass: HomeAssistant, _config: dict) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up one camera from a config entry."""
     _ensure_store(hass)
+    await hass.async_add_executor_job(_purge_legacy_thumb_cache, hass)
     runtime = CameraRuntime(hass, entry)
     hass.data[DOMAIN]["entries"][entry.entry_id] = runtime
 

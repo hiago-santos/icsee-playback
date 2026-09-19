@@ -9,7 +9,6 @@ import subprocess
 import threading
 import time
 from datetime import date, timedelta
-from pathlib import Path
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -21,10 +20,15 @@ from .const import (
     CONF_CHANNEL,
     DEFAULT_CHANNEL,
     DEFAULT_PORT,
-    THUMB_CACHE_MAX_AGE_SEC,
-    THUMB_CACHE_MAX_BYTES,
+    THUMB_WORKERS,
 )
-from .dvrip import DVRIP, format_camera_time, parse_camera_time, prepare_video_es
+from .dvrip import (
+    DVRIP,
+    annexb_has_keyframe,
+    format_camera_time,
+    parse_camera_time,
+    prepare_video_es,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,6 +47,72 @@ class PlaySuperseded(Exception):
 
 class PlayBusy(Exception):
     """Camera lock could not be taken in time."""
+
+
+class _ThumbWaiter:
+    """Coalesce concurrent thumbnail requests; nothing is written to disk."""
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.data: bytes | None = None
+        self.error: BaseException | None = None
+
+
+class _DvripPool:
+    """Keep a few logged-in DVRIP sockets so thumbs skip TCP+login each time."""
+
+    def __init__(self, factory, size: int) -> None:
+        self._factory = factory
+        self._size = size
+        self._idle: list[tuple[float, DVRIP]] = []
+        self._lock = threading.Lock()
+
+    def borrow(self) -> DVRIP:
+        now = time.monotonic()
+        with self._lock:
+            while self._idle:
+                stamp, dvr = self._idle.pop()
+                if now - stamp < 25 and dvr.sock is not None:
+                    return dvr
+                try:
+                    dvr.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        return self._factory()
+
+    def give(self, dvr: DVRIP, ok: bool) -> None:
+        if not ok or dvr.sock is None:
+            try:
+                dvr.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        try:
+            dvr.sock.settimeout(8)
+        except OSError:
+            try:
+                dvr.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        with self._lock:
+            if len(self._idle) >= self._size:
+                try:
+                    dvr.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            self._idle.append((time.monotonic(), dvr))
+
+    def discard_idle(self) -> None:
+        with self._lock:
+            leftover = self._idle
+            self._idle = []
+        for _stamp, dvr in leftover:
+            try:
+                dvr.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 _ENCODER_CACHE: dict[str, str] = {}
@@ -267,7 +337,9 @@ class CameraRuntime:
         self._cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._proc = None
         self._thumb_guard = threading.Lock()
-        self._thumb_inflight: dict[str, threading.Event] = {}
+        self._thumb_inflight: dict[str, _ThumbWaiter] = {}
+        self._thumb_slots = threading.Semaphore(THUMB_WORKERS)
+        self._thumb_pool = _DvripPool(self._session, THUMB_WORKERS)
 
     @property
     def name(self) -> str:
@@ -422,6 +494,7 @@ class CameraRuntime:
             out_queue.put(PlayBusy("A câmera já está em playback."))
             out_queue.put(None)
             return
+        self._thumb_pool.discard_idle()
         if stop.is_set() or my_gen != self._gen:
             self.lock.release()
             out_queue.put(PlaySuperseded("Playback substituído por outro pedido."))
@@ -593,109 +666,92 @@ class CameraRuntime:
         finally:
             self.lock.release()
 
-    def _thumb_dir(self) -> Path:
-        path = Path(self.hass.config.path(".storage", "icsee_playback_thumbs"))
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
     def _thumb_key(self, file_info: dict[str, Any]) -> str:
         raw = f"{file_info.get('FileName')}|{file_info.get('BeginTime')}"
         return hashlib.sha1(raw.encode()).hexdigest()
 
-    def _prune_thumbs(self) -> None:
-        folder = self._thumb_dir()
-        now = time.time()
-        kept: list[tuple[float, int, Path]] = []
-        total = 0
-        for item in folder.glob("*.jpg"):
-            try:
-                st = item.stat()
-            except OSError:
-                continue
-            if now - st.st_mtime > THUMB_CACHE_MAX_AGE_SEC:
-                try:
-                    item.unlink()
-                except OSError:
-                    pass
-                continue
-            kept.append((st.st_mtime, st.st_size, item))
-            total += st.st_size
-        if total <= THUMB_CACHE_MAX_BYTES:
-            return
-        kept.sort()
-        for _mtime, size, item in kept:
-            if total <= THUMB_CACHE_MAX_BYTES:
-                break
-            try:
-                item.unlink()
-                total -= size
-            except OSError:
-                pass
-
     def get_thumbnail(self, file_info: dict[str, Any], ffmpeg_bin: str) -> bytes:
-        """JPEG for the grid: cached after the first DVRIP pull."""
+        """JPEG for the grid. The app caches on device; HA only coalesces inflight pulls."""
         file_info = dict(file_info)
         file_info.setdefault("Channel", self.channel)
         key = self._thumb_key(file_info)
-        path = self._thumb_dir() / f"{key}.jpg"
-        if path.is_file() and path.stat().st_size > 64:
-            try:
-                path.touch()
-            except OSError:
-                pass
-            return path.read_bytes()
 
         with self._thumb_guard:
             waiter = self._thumb_inflight.get(key)
             owner = waiter is None
             if owner:
-                waiter = threading.Event()
+                waiter = _ThumbWaiter()
                 self._thumb_inflight[key] = waiter
 
         if not owner:
-            if waiter.wait(timeout=50) and path.is_file() and path.stat().st_size > 64:
-                return path.read_bytes()
+            if not waiter.event.wait(timeout=50):
+                raise RuntimeError("Miniatura ocupada")
+            if waiter.error is not None:
+                raise waiter.error
+            if waiter.data:
+                return waiter.data
             raise RuntimeError("Miniatura ocupada")
 
         try:
-            if not self.lock.acquire(timeout=45):
+            if not self._thumb_slots.acquire(timeout=45):
                 raise PlayBusy("Câmera ocupada (miniatura)")
+            dvr = None
+            ok = False
             try:
+                dvr = self._thumb_pool.borrow()
                 name = str(file_info.get("FileName") or "")
                 if name.lower().endswith((".jpg", ".jpeg")):
-                    jpeg = self._download_snapshot_unlocked(file_info)
+                    jpeg = self._download_snapshot_unlocked(
+                        file_info, max_bytes=1_500_000, dvr=dvr
+                    )
                 else:
-                    jpeg = self._video_thumb_unlocked(file_info, ffmpeg_bin)
+                    jpeg = self._video_thumb_unlocked(file_info, ffmpeg_bin, dvr=dvr)
+                jpeg = self._downscale_thumb(jpeg, ffmpeg_bin)
+                ok = True
             finally:
-                self.lock.release()
-            tmp = path.with_suffix(".tmp")
-            tmp.write_bytes(jpeg)
-            tmp.replace(path)
-            self._prune_thumbs()
+                if dvr is not None:
+                    self._thumb_pool.give(dvr, ok)
+                self._thumb_slots.release()
+            waiter.data = jpeg
             return jpeg
+        except Exception as err:
+            waiter.error = err
+            raise
         finally:
-            waiter.set()
+            waiter.event.set()
             with self._thumb_guard:
                 self._thumb_inflight.pop(key, None)
 
-    def _video_thumb_unlocked(self, file_info: dict[str, Any], ffmpeg_bin: str) -> bytes:
-        """First video frame, like the iCSee app list. Lock must be held."""
-        dvr = None
+    def _video_thumb_unlocked(
+        self,
+        file_info: dict[str, Any],
+        ffmpeg_bin: str,
+        dvr: DVRIP | None = None,
+    ) -> bytes:
+        """First video frame. Caller owns the DVRIP session if [dvr] is set."""
+        owned = dvr is None
+        if owned:
+            dvr = self._session()
         buf = bytearray()
         codec = "hevc"
         try:
-            dvr = self._session()
-            for es, demuxer in dvr.iter_file_stream(file_info):
+            for es, demuxer in dvr.iter_file_stream(file_info, timeout=8):
                 buf.extend(es)
                 if demuxer.codec:
                     codec = demuxer.codec
-                if len(buf) >= 800_000:
+                if len(buf) >= 16_384:
+                    prepared = prepare_video_es(bytes(buf), codec)
+                    if annexb_has_keyframe(prepared, codec):
+                        buf = bytearray(prepared)
+                        break
+                if len(buf) >= 220_000:
                     break
         finally:
-            if dvr:
+            if owned and dvr:
                 dvr.close()
         if len(buf) < 64:
             raise RuntimeError("A câmera não enviou vídeo para a miniatura.")
+        es_in = prepare_video_es(bytes(buf), codec)
         fmt = "hevc" if codec == "hevc" else "h264"
         proc = subprocess.run(
             [
@@ -717,7 +773,7 @@ class CameraRuntime:
                 "image2",
                 "pipe:1",
             ],
-            input=bytes(buf),
+            input=es_in,
             capture_output=True,
             timeout=20,
             check=False,
@@ -726,29 +782,65 @@ class CameraRuntime:
         if proc.returncode != 0 or jpeg[:2] != b"\xff\xd8":
             err = (proc.stderr or b"").decode("utf-8", "ignore")[-240:]
             raise RuntimeError(err or "ffmpeg não gerou a miniatura")
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Video thumb %sB from %s (%s %sB es)",
             len(jpeg),
             file_info.get("FileName"),
             codec,
-            len(buf),
+            len(es_in),
         )
         return jpeg
 
+    def _downscale_thumb(self, jpeg: bytes, ffmpeg_bin: str) -> bytes:
+        """Grid tiles are ~480px; sending the camera's 8MP JPEG is wasted work."""
+        if len(jpeg) < 48_000 or jpeg[:2] != b"\xff\xd8":
+            return jpeg
+        proc = subprocess.run(
+            [
+                ffmpeg_bin,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "image2pipe",
+                "-i",
+                "pipe:0",
+                "-vf",
+                "scale=480:-2",
+                "-q:v",
+                "7",
+                "-f",
+                "image2",
+                "pipe:1",
+            ],
+            input=jpeg,
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
+        out = proc.stdout or b""
+        if proc.returncode == 0 and out[:2] == b"\xff\xd8" and len(out) < len(jpeg):
+            return out
+        return jpeg
+
     def _download_snapshot_unlocked(
-        self, file_info: dict[str, Any], max_bytes: int = 8_000_000
+        self,
+        file_info: dict[str, Any],
+        max_bytes: int = 8_000_000,
+        dvr: DVRIP | None = None,
     ) -> bytes:
-        dvr = None
+        owned = dvr is None
+        if owned:
+            dvr = self._session()
         buf = bytearray()
         try:
-            dvr = self._session()
-            for chunk in dvr.iter_raw_download(file_info):
+            for chunk in dvr.iter_raw_download(file_info, timeout=8):
                 buf.extend(chunk)
                 start = bytes(buf).find(b"\xff\xd8")
                 end = bytes(buf).rfind(b"\xff\xd9")
                 if start >= 0 and end > start:
                     jpeg = bytes(buf[start : end + 2])
-                    _LOGGER.warning(
+                    _LOGGER.debug(
                         "Snapshot extracted %sB from %s",
                         len(jpeg),
                         file_info.get("FileName"),
@@ -757,7 +849,7 @@ class CameraRuntime:
                 if len(buf) >= max_bytes:
                     break
         finally:
-            if dvr:
+            if owned and dvr:
                 dvr.close()
         data = bytes(buf)
         start = data.find(b"\xff\xd8")
@@ -782,3 +874,4 @@ class CameraRuntime:
                 proc.kill()
             except Exception:  # noqa: BLE001
                 pass
+        self._thumb_pool.discard_idle()

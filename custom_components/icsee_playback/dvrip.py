@@ -2,7 +2,7 @@ import json
 import hashlib
 import socket
 import struct
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 OK_RET = {100, 110, 111}
@@ -30,6 +30,13 @@ def parse_camera_time(value):
 
 def format_camera_time(value):
     return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _step_camera_time(raw: str, seconds: int) -> str | None:
+    try:
+        return format_camera_time(parse_camera_time(raw) + timedelta(seconds=seconds))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def parse_file_length_kb(value):
@@ -365,15 +372,17 @@ class DVRIP:
         collected = []
         seen = set()
         cursor = start_time
+        window_end = end_time
+        origin_start = start_time
 
-        while True:
+        for _ in range(48):
             payload = {
                 "Name": "OPFileQuery",
                 "OPFileQuery": {
                     "BeginTime": cursor,
                     "Channel": channel,
                     "DriverTypeMask": "0x0000FFFF",
-                    "EndTime": end_time,
+                    "EndTime": window_end,
                     "Event": "*",
                     "StreamType": "0x00000000",
                     "Type": file_type,
@@ -406,9 +415,18 @@ class DVRIP:
             if len(batch) < 64 or not batch or new_items == 0:
                 break
 
-            cursor = batch[-1]["BeginTime"]
-            if cursor >= end_time:
-                break
+            first_b = str(batch[0].get("BeginTime") or "")
+            last_b = str(batch[-1].get("BeginTime") or "")
+            if last_b > first_b:
+                nxt = _step_camera_time(last_b, 1)
+                if not nxt or nxt <= cursor or nxt >= window_end:
+                    break
+                cursor = nxt
+            else:
+                if last_b <= origin_start:
+                    break
+                window_end = last_b
+                cursor = origin_start
 
         return collected
 

@@ -256,17 +256,21 @@ class DVRIP:
         self.sock.connect((self.ip, self.port))
 
     def close(self):
-        if self.sock:
-            try:
-                if self.session:
-                    self.send_packet(1002, {"Name": "OPLogout"})
-            except OSError:
-                pass
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-            self.sock = None
+        sock = self.sock
+        if sock is None:
+            self.session = 0
+            return
+        try:
+            if self.session:
+                self.send_packet(1002, {"Name": "OPLogout"})
+        except (OSError, ConnectionError, AttributeError):
+            pass
+        self.sock = None
+        self.session = 0
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     def interrupt(self):
         """Unblock recv() from another thread. Skips logout on purpose."""

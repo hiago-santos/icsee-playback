@@ -40,12 +40,12 @@ Tested with hardware like `XM530V200_X2C-WQ_8M` (model **X2C-WQ**). Other Sofia/
 
 ### HACS install
 
-Until it is in the default HACS store, add it as a **custom repository**:
+Add it as a **custom repository** (it is not in the default HACS store yet). HACS installs **GitHub Releases** (`0.3.x`), not a commit hash.
 
 1. HACS → Integrations → ⋮ → **Custom repositories**
 2. URL: `https://github.com/hiago-santos/icsee-playback`
 3. Category: **Integration**
-4. Download **iCSee Playback** and restart Home Assistant
+4. Download **iCSee Playback** (latest release) and restart Home Assistant
 5. Settings → Devices & services → **Add integration** → **iCSee Playback**
 
 ### Manual install
@@ -109,10 +109,12 @@ Não substitui a câmera ao vivo. O Home Assistant só faz a ponte DVRIP → HTT
 
 ### Instalar pelo HACS
 
+Ainda não está no catálogo padrão do HACS: cadastre o **repositório personalizado**. As atualizações usam os **GitHub Releases** (`0.3.x`), não o hash do commit.
+
 1. HACS → Integrações → ⋮ → **Repositórios personalizados**
 2. URL: `https://github.com/hiago-santos/icsee-playback`
 3. Categoria: **Integration**
-4. Baixe **iCSee Playback** e reinicie o Home Assistant
+4. Baixe **iCSee Playback** (último release) e reinicie o Home Assistant
 5. Configurações → Dispositivos e serviços → **Adicionar integração** → **iCSee Playback**
 
 Informe IP, porta `34567`, usuário e senha da câmera. Canal `0` é o primeiro.

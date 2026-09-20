@@ -5,7 +5,7 @@
 # iCSee Playback
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
-[![GitHub release](https://img.shields.io/github/v/release/hiago-santos/icsee-playback?include_prereleases)](https://github.com/hiago-santos/icsee-playback/releases)
+[![GitHub release](https://img.shields.io/github/v/release/hiago-santos/icsee-playback?display_name=tag&label=release)](https://github.com/hiago-santos/icsee-playback/releases)
 
 Home Assistant custom integration that lists and plays **SD-card recordings** from [iCSee](https://www.icsee.com/) / Xiongmai cameras (Sofia / DVRIP, TCP port **34567**).
 

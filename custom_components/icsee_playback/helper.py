@@ -316,7 +316,7 @@ def take_playable_start(stream, stop: threading.Event | None = None):
         if annexb_has_params(prepared, codec) and annexb_has_keyframe(prepared, codec):
             skipped = max(0, len(buf) - len(prepared))
             if skipped:
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "Playback skipped %sB until keyframe (%s chunks)",
                     skipped,
                     chunks,
@@ -657,14 +657,14 @@ class CameraRuntime:
 
         try:
             filename = file_info.get("FileName")
-            _LOGGER.warning("Playback connecting %s", filename)
+            _LOGGER.debug("Playback connecting %s", filename)
             dvr = self._session()
             with self._ctrl:
                 self._play_dvr = dvr
             stream = dvr.iter_file_stream(file_info)
             first_es, demuxer = take_playable_start(stream, stop)
             codec = demuxer.codec or "hevc"
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "Playback stream codec=%s %sx%s@%s first=%sB head=%s file=%s",
                 codec,
                 demuxer.width,
@@ -676,7 +676,7 @@ class CameraRuntime:
             )
 
             cmd = ffmpeg_cmd(ffmpeg_bin, codec, mode, fps=demuxer.fps)
-            _LOGGER.warning("ffmpeg mode=%s cmd: %s", mode, " ".join(cmd))
+            _LOGGER.debug("ffmpeg mode=%s cmd: %s", mode, " ".join(cmd))
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -776,7 +776,7 @@ class CameraRuntime:
                 if not sent_header:
                     pending.extend(data)
                     if b"moov" in pending and len(pending) >= 64:
-                        _LOGGER.warning(
+                        _LOGGER.debug(
                             "Playback ffmpeg init segment %sB", len(pending)
                         )
                     elif len(pending) > 2_000_000:

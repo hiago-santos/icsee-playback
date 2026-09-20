@@ -72,7 +72,7 @@ class IcseePlaybackView(HomeAssistantView):
             "Channel": runtime.channel,
         }
 
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Play request %s t=%s begin=%s",
             filename,
             request.query.get("t"),
@@ -108,7 +108,7 @@ class IcseePlaybackView(HomeAssistantView):
                 raise web.HTTPBadGateway(text=str(err)) from err
             if not data:
                 raise web.HTTPBadGateway(text="Foto vazia")
-            _LOGGER.warning("Snapshot ok %sB %s", len(data), filename)
+            _LOGGER.debug("Snapshot ok %sB %s", len(data), filename)
             return web.Response(
                 body=data,
                 content_type="image/jpeg",
@@ -119,7 +119,7 @@ class IcseePlaybackView(HomeAssistantView):
         stop = threading.Event()
         chunks: queue.Queue = queue.Queue(maxsize=32)
         ffmpeg_bin = _ffmpeg_binary(hass)
-        _LOGGER.warning("Playback ffmpeg binary=%s mode=%s", ffmpeg_bin, mode)
+        _LOGGER.debug("Playback ffmpeg binary=%s mode=%s", ffmpeg_bin, mode)
 
         producer = threading.Thread(
             target=runtime.stream_clip,

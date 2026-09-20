@@ -263,7 +263,10 @@ def ffmpeg_cmd(
     ]
     if normalize_play_mode(mode) == PLAY_MODE_BRIDGE:
         tag = "hvc1" if codec == "hevc" else "avc1"
-        return [*common, "-c:v", "copy", "-tag:v", tag, *mux]
+        # Copy não gera PTS; sem isso o muxer MP4 avisa "Timestamps are unset"
+        # e em ffmpeg futuro pode recusar o pacote.
+        stamps = f"setts=pts=N/{rate}/TB:dts=N/{rate}/TB"
+        return [*common, "-c:v", "copy", "-tag:v", tag, "-bsf:v", stamps, *mux]
     encoder = detect_video_encoder(binary)
     cmd = [*common, "-c:v", encoder, "-pix_fmt", "yuv420p", *mux]
     if encoder == "libx264":
@@ -275,6 +278,21 @@ def ffmpeg_cmd(
             "zerolatency",
         ]
     return cmd
+
+
+def _ffmpeg_noise(text: str) -> bool:
+    """Avisos que o bitstream da câmera gera o tempo todo e não derrubam o clipe."""
+    return any(
+        needle in text
+        for needle in (
+            "Timestamps are unset",
+            "Failed to parse header of NALU",
+            "Skipping invalid undecodable NALU",
+            "Skipping NALU",
+            "PPS id out of range",
+            "Last message repeated",
+        )
+    )
 
 
 def take_playable_start(stream, stop: threading.Event | None = None):
@@ -539,7 +557,7 @@ class CameraRuntime:
                             "File query type=%s failed: %s", file_type, err
                         )
                         continue
-                    _LOGGER.warning(
+                    _LOGGER.debug(
                         "Listed %s clip(s) %s..%s type=%s",
                         len(batch),
                         first_day.isoformat(),
@@ -687,7 +705,9 @@ class CameraRuntime:
                         if not text:
                             continue
                         count += 1
-                        if count <= 40:
+                        if _ffmpeg_noise(text):
+                            _LOGGER.debug("ffmpeg: %s", text)
+                        elif count <= 40:
                             _LOGGER.warning("ffmpeg: %s", text)
                         else:
                             _LOGGER.debug("ffmpeg: %s", text)

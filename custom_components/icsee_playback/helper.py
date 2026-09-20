@@ -49,6 +49,28 @@ class PlayBusy(Exception):
     """Camera lock could not be taken in time."""
 
 
+def _clip_span_key(item: dict[str, Any]) -> tuple:
+    name = str(item.get("FileName") or "").lower()
+    photo = name.endswith((".jpg", ".jpeg"))
+    return (item.get("BeginTime"), item.get("EndTime"), photo)
+
+
+def _clip_name_rank(item: dict[str, Any]) -> int:
+    name = str(item.get("FileName") or "").lower()
+    if name.endswith((".h264", ".mp4", ".jpg", ".jpeg")):
+        return 2
+    return 1
+
+
+def _map_thumb_error(err: Exception) -> Exception:
+    if isinstance(err, (PlayBusy, PlaySuperseded)):
+        return err
+    text = str(err).lower()
+    if "recusou o claim" in text or "downloadstart recusado" in text:
+        return PlayBusy("Câmera ocupada (miniatura)")
+    return err
+
+
 class _ThumbWaiter:
     """Coalesce concurrent thumbnail requests; nothing is written to disk."""
 
@@ -447,8 +469,14 @@ class CameraRuntime:
             raise
         finally:
             self._query_lock.release()
+        by_span: dict[tuple, dict[str, Any]] = {}
+        for item in by_name.values():
+            key = _clip_span_key(item)
+            prev = by_span.get(key)
+            if prev is None or _clip_name_rank(item) > _clip_name_rank(prev):
+                by_span[key] = item
         files = sorted(
-            by_name.values(),
+            by_span.values(),
             key=lambda item: item.get("BeginTime") or "",
             reverse=True,
         )
@@ -500,6 +528,7 @@ class CameraRuntime:
             out_queue.put(PlayBusy("A câmera já está em playback."))
             out_queue.put(None)
             return
+        self.interrupt_all_thumbs()
         self._thumb_pool.discard_idle()
         if stop.is_set() or my_gen != self._gen:
             self.lock.release()
@@ -683,6 +712,17 @@ class CameraRuntime:
         if dvr is not None:
             dvr.interrupt()
 
+    def interrupt_all_thumbs(self) -> None:
+        """Playback is starting: drop in-flight thumbnail sockets."""
+        with self._thumb_guard:
+            live = list(self._thumb_live.values())
+            self._thumb_live.clear()
+        for dvr in live:
+            try:
+                dvr.interrupt()
+            except Exception:  # noqa: BLE001
+                pass
+
     def download_snapshot(
         self,
         file_info: dict[str, Any],
@@ -750,6 +790,8 @@ class CameraRuntime:
             raise RuntimeError("Miniatura ocupada")
 
         try:
+            if self.lock.locked():
+                raise PlayBusy("A câmera já está em playback.")
             deadline = time.monotonic() + 8
             while not self._thumb_slots.acquire(timeout=0.15):
                 if stop.is_set():
@@ -784,8 +826,9 @@ class CameraRuntime:
             waiter.data = jpeg
             return jpeg
         except Exception as err:
-            waiter.error = err
-            raise
+            mapped = _map_thumb_error(err)
+            waiter.error = mapped
+            raise mapped from err
         finally:
             waiter.event.set()
             with self._thumb_guard:

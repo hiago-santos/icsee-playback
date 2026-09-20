@@ -249,6 +249,22 @@ class DVRIP:
                 pass
             self.sock = None
 
+    def interrupt(self):
+        """Unblock recv() from another thread. Skips logout on purpose."""
+        sock = self.sock
+        self.sock = None
+        self.session = 0
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
     def session_hex(self):
         return f"0x{self.session:08X}"
 

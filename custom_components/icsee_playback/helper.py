@@ -336,8 +336,10 @@ class CameraRuntime:
         self._active_stop: threading.Event | None = None
         self._cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._proc = None
+        self._play_dvr: DVRIP | None = None
         self._thumb_guard = threading.Lock()
         self._thumb_inflight: dict[str, _ThumbWaiter] = {}
+        self._thumb_live: dict[int, DVRIP] = {}
         self._thumb_slots = threading.Semaphore(THUMB_WORKERS)
         self._thumb_pool = _DvripPool(self._session, THUMB_WORKERS)
 
@@ -482,15 +484,19 @@ class CameraRuntime:
             if self._active_stop is not None:
                 self._active_stop.set()
             old_proc = self._proc
+            old_dvr = self._play_dvr
             self._proc = None
+            self._play_dvr = None
             self._active_stop = stop
         if old_proc:
             try:
                 old_proc.kill()
             except Exception:  # noqa: BLE001
                 pass
+        if old_dvr is not None:
+            old_dvr.interrupt()
 
-        if not self.lock.acquire(timeout=20):
+        if not self.lock.acquire(timeout=8):
             out_queue.put(PlayBusy("A câmera já está em playback."))
             out_queue.put(None)
             return
@@ -505,6 +511,8 @@ class CameraRuntime:
             filename = file_info.get("FileName")
             _LOGGER.warning("Playback connecting %s", filename)
             dvr = self._session()
+            with self._ctrl:
+                self._play_dvr = dvr
             stream = dvr.iter_file_stream(file_info)
             try:
                 first_es, demuxer = next(stream)
@@ -547,6 +555,8 @@ class CameraRuntime:
                         proc.kill()
                     except Exception:  # noqa: BLE001
                         pass
+                if dvr:
+                    dvr.interrupt()
 
             def drain_stderr() -> None:
                 count = 0
@@ -645,6 +655,8 @@ class CameraRuntime:
                     pass
             if my_gen == self._gen:
                 self._proc = None
+                if self._play_dvr is dvr:
+                    self._play_dvr = None
             try:
                 if stream is not None:
                     stream.close()
@@ -655,32 +667,66 @@ class CameraRuntime:
             self.lock.release()
             out_queue.put(None)
 
-    def download_snapshot(self, file_info: dict[str, Any], max_bytes: int = 8_000_000) -> bytes:
+    def _bind_thumb(self, stop: threading.Event, dvr: DVRIP) -> None:
+        with self._thumb_guard:
+            self._thumb_live[id(stop)] = dvr
+
+    def _unbind_thumb(self, stop: threading.Event) -> None:
+        with self._thumb_guard:
+            self._thumb_live.pop(id(stop), None)
+
+    def interrupt_thumb(self, stop: threading.Event) -> None:
+        """Drop the DVRIP socket for a cancelled thumbnail/snapshot HTTP client."""
+        stop.set()
+        with self._thumb_guard:
+            dvr = self._thumb_live.pop(id(stop), None)
+        if dvr is not None:
+            dvr.interrupt()
+
+    def download_snapshot(
+        self,
+        file_info: dict[str, Any],
+        max_bytes: int = 8_000_000,
+        stop: threading.Event | None = None,
+    ) -> bytes:
         """Pull a JPEG from the camera without treating it as video."""
         file_info = dict(file_info)
         file_info.setdefault("Channel", self.channel)
+        stop = stop or threading.Event()
         if not self._thumb_slots.acquire(timeout=8):
             raise RuntimeError("Câmera ocupada (playback em andamento)")
         dvr = None
         ok = False
         try:
+            if stop.is_set():
+                raise PlaySuperseded("Foto cancelada")
             dvr = self._thumb_pool.borrow()
-            data = self._download_snapshot_unlocked(file_info, max_bytes, dvr=dvr)
+            self._bind_thumb(stop, dvr)
+            data = self._download_snapshot_unlocked(
+                file_info, max_bytes, dvr=dvr, stop=stop
+            )
             ok = True
             return data
         finally:
+            self._unbind_thumb(stop)
             if dvr is not None:
-                self._thumb_pool.give(dvr, ok)
+                self._thumb_pool.give(dvr, ok and not stop.is_set())
             self._thumb_slots.release()
 
     def _thumb_key(self, file_info: dict[str, Any]) -> str:
         raw = f"{file_info.get('FileName')}|{file_info.get('BeginTime')}"
         return hashlib.sha1(raw.encode()).hexdigest()
 
-    def get_thumbnail(self, file_info: dict[str, Any], ffmpeg_bin: str) -> bytes:
+    def get_thumbnail(
+        self,
+        file_info: dict[str, Any],
+        ffmpeg_bin: str,
+        stop: threading.Event | None = None,
+    ) -> bytes:
         """JPEG for the grid. The app caches on device; HA only coalesces inflight pulls."""
         file_info = dict(file_info)
         file_info.setdefault("Channel", self.channel)
+        stop = stop or threading.Event()
         key = self._thumb_key(file_info)
 
         with self._thumb_guard:
@@ -691,8 +737,12 @@ class CameraRuntime:
                 self._thumb_inflight[key] = waiter
 
         if not owner:
-            if not waiter.event.wait(timeout=50):
-                raise RuntimeError("Miniatura ocupada")
+            deadline = time.monotonic() + 8
+            while not waiter.event.wait(timeout=0.15):
+                if stop.is_set():
+                    raise PlaySuperseded("Miniatura cancelada")
+                if time.monotonic() > deadline:
+                    raise RuntimeError("Miniatura ocupada")
             if waiter.error is not None:
                 raise waiter.error
             if waiter.data:
@@ -700,24 +750,36 @@ class CameraRuntime:
             raise RuntimeError("Miniatura ocupada")
 
         try:
-            if not self._thumb_slots.acquire(timeout=45):
-                raise PlayBusy("Câmera ocupada (miniatura)")
+            deadline = time.monotonic() + 8
+            while not self._thumb_slots.acquire(timeout=0.15):
+                if stop.is_set():
+                    raise PlaySuperseded("Miniatura cancelada")
+                if time.monotonic() > deadline:
+                    raise PlayBusy("Câmera ocupada (miniatura)")
             dvr = None
             ok = False
             try:
+                if stop.is_set():
+                    raise PlaySuperseded("Miniatura cancelada")
                 dvr = self._thumb_pool.borrow()
+                self._bind_thumb(stop, dvr)
                 name = str(file_info.get("FileName") or "")
                 if name.lower().endswith((".jpg", ".jpeg")):
                     jpeg = self._download_snapshot_unlocked(
-                        file_info, max_bytes=1_500_000, dvr=dvr, timeout=12
+                        file_info, max_bytes=1_500_000, dvr=dvr, timeout=12, stop=stop
                     )
                 else:
-                    jpeg = self._video_thumb_unlocked(file_info, ffmpeg_bin, dvr=dvr)
+                    jpeg = self._video_thumb_unlocked(
+                        file_info, ffmpeg_bin, dvr=dvr, stop=stop
+                    )
                     jpeg = self._downscale_thumb(jpeg, ffmpeg_bin)
+                if stop.is_set():
+                    raise PlaySuperseded("Miniatura cancelada")
                 ok = True
             finally:
+                self._unbind_thumb(stop)
                 if dvr is not None:
-                    self._thumb_pool.give(dvr, ok)
+                    self._thumb_pool.give(dvr, ok and not stop.is_set())
                 self._thumb_slots.release()
             waiter.data = jpeg
             return jpeg
@@ -734,6 +796,7 @@ class CameraRuntime:
         file_info: dict[str, Any],
         ffmpeg_bin: str,
         dvr: DVRIP | None = None,
+        stop: threading.Event | None = None,
     ) -> bytes:
         """First video frame. Caller owns the DVRIP session if [dvr] is set."""
         owned = dvr is None
@@ -743,6 +806,8 @@ class CameraRuntime:
         codec = "hevc"
         try:
             for es, demuxer in dvr.iter_file_stream(file_info, timeout=8):
+                if stop is not None and stop.is_set():
+                    raise PlaySuperseded("Miniatura cancelada")
                 buf.extend(es)
                 if demuxer.codec:
                     codec = demuxer.codec
@@ -836,6 +901,7 @@ class CameraRuntime:
         max_bytes: int = 8_000_000,
         dvr: DVRIP | None = None,
         timeout: float = 12,
+        stop: threading.Event | None = None,
     ) -> bytes:
         owned = dvr is None
         if owned:
@@ -844,6 +910,8 @@ class CameraRuntime:
         soi = -1
         try:
             for chunk in dvr.iter_raw_download(file_info, timeout=timeout):
+                if stop is not None and stop.is_set():
+                    raise PlaySuperseded("Foto cancelada")
                 if not chunk:
                     continue
                 buf.extend(chunk)
@@ -888,10 +956,16 @@ class CameraRuntime:
 
     def abort(self) -> None:
         """Stop an in-flight ffmpeg/DVRIP download."""
-        proc = self._proc
+        with self._ctrl:
+            if self._active_stop is not None:
+                self._active_stop.set()
+            proc = self._proc
+            dvr = self._play_dvr
         if proc:
             try:
                 proc.kill()
             except Exception:  # noqa: BLE001
                 pass
+        if dvr is not None:
+            dvr.interrupt()
         self._thumb_pool.discard_idle()

@@ -80,17 +80,30 @@ class IcseePlaybackView(HomeAssistantView):
         )
 
         if _is_jpeg(filename):
+            stop = threading.Event()
+
+            def _pull_jpeg() -> bytes:
+                return runtime.download_snapshot(file_info, stop=stop)
+
             try:
                 data = await asyncio.wait_for(
-                    hass.async_add_executor_job(
-                        runtime.download_snapshot, file_info
-                    ),
+                    hass.async_add_executor_job(_pull_jpeg),
                     timeout=20,
                 )
+            except asyncio.CancelledError:
+                stop.set()
+                runtime.interrupt_thumb(stop)
+                raise
             except TimeoutError as err:
+                stop.set()
+                runtime.interrupt_thumb(stop)
                 _LOGGER.error("Snapshot timeout: %s", filename)
                 raise web.HTTPGatewayTimeout(text="A câmera não enviou a foto a tempo") from err
+            except PlaySuperseded as err:
+                raise web.HTTPConflict(text=str(err)) from err
             except Exception as err:  # noqa: BLE001
+                if stop.is_set():
+                    raise web.HTTPConflict(text="Foto cancelada") from err
                 _LOGGER.exception("Snapshot download failed")
                 raise web.HTTPBadGateway(text=str(err)) from err
             if not data:
@@ -203,18 +216,31 @@ class IcseeThumbView(HomeAssistantView):
             "Channel": runtime.channel,
         }
         ffmpeg_bin = _ffmpeg_binary(hass)
+        stop = threading.Event()
+
+        def _pull_thumb() -> bytes:
+            return runtime.get_thumbnail(file_info, ffmpeg_bin, stop)
+
         try:
             data = await asyncio.wait_for(
-                hass.async_add_executor_job(
-                    runtime.get_thumbnail, file_info, ffmpeg_bin
-                ),
+                hass.async_add_executor_job(_pull_thumb),
                 timeout=55,
             )
+        except asyncio.CancelledError:
+            stop.set()
+            runtime.interrupt_thumb(stop)
+            raise
         except TimeoutError as err:
+            stop.set()
+            runtime.interrupt_thumb(stop)
             raise web.HTTPGatewayTimeout(text="A câmera não enviou a miniatura a tempo") from err
         except PlayBusy as err:
             raise web.HTTPConflict(text=str(err)) from err
+        except PlaySuperseded as err:
+            raise web.HTTPConflict(text=str(err)) from err
         except Exception as err:  # noqa: BLE001
+            if stop.is_set():
+                raise web.HTTPConflict(text="Miniatura cancelada") from err
             _LOGGER.warning("Thumbnail failed %s: %s", filename, err)
             raise web.HTTPBadGateway(text=str(err)) from err
         if not data:

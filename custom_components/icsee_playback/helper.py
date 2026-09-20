@@ -659,12 +659,19 @@ class CameraRuntime:
         """Pull a JPEG from the camera without treating it as video."""
         file_info = dict(file_info)
         file_info.setdefault("Channel", self.channel)
-        if not self.lock.acquire(timeout=8):
+        if not self._thumb_slots.acquire(timeout=8):
             raise RuntimeError("Câmera ocupada (playback em andamento)")
+        dvr = None
+        ok = False
         try:
-            return self._download_snapshot_unlocked(file_info, max_bytes)
+            dvr = self._thumb_pool.borrow()
+            data = self._download_snapshot_unlocked(file_info, max_bytes, dvr=dvr)
+            ok = True
+            return data
         finally:
-            self.lock.release()
+            if dvr is not None:
+                self._thumb_pool.give(dvr, ok)
+            self._thumb_slots.release()
 
     def _thumb_key(self, file_info: dict[str, Any]) -> str:
         raw = f"{file_info.get('FileName')}|{file_info.get('BeginTime')}"
@@ -702,11 +709,11 @@ class CameraRuntime:
                 name = str(file_info.get("FileName") or "")
                 if name.lower().endswith((".jpg", ".jpeg")):
                     jpeg = self._download_snapshot_unlocked(
-                        file_info, max_bytes=1_500_000, dvr=dvr
+                        file_info, max_bytes=1_500_000, dvr=dvr, timeout=12
                     )
                 else:
                     jpeg = self._video_thumb_unlocked(file_info, ffmpeg_bin, dvr=dvr)
-                jpeg = self._downscale_thumb(jpeg, ffmpeg_bin)
+                    jpeg = self._downscale_thumb(jpeg, ffmpeg_bin)
                 ok = True
             finally:
                 if dvr is not None:
@@ -828,18 +835,31 @@ class CameraRuntime:
         file_info: dict[str, Any],
         max_bytes: int = 8_000_000,
         dvr: DVRIP | None = None,
+        timeout: float = 12,
     ) -> bytes:
         owned = dvr is None
         if owned:
             dvr = self._session()
         buf = bytearray()
+        soi = -1
         try:
-            for chunk in dvr.iter_raw_download(file_info, timeout=8):
+            for chunk in dvr.iter_raw_download(file_info, timeout=timeout):
+                if not chunk:
+                    continue
                 buf.extend(chunk)
-                start = bytes(buf).find(b"\xff\xd8")
-                end = bytes(buf).rfind(b"\xff\xd9")
-                if start >= 0 and end > start:
-                    jpeg = bytes(buf[start : end + 2])
+                if soi < 0:
+                    soi = buf.find(b"\xff\xd8")
+                    if soi < 0:
+                        if len(buf) > 8:
+                            del buf[:-1]
+                        continue
+                    if soi:
+                        del buf[:soi]
+                        soi = 0
+                lookback = max(0, len(buf) - len(chunk) - 1)
+                eoi = buf.find(b"\xff\xd9", lookback)
+                if eoi >= 0:
+                    jpeg = bytes(buf[: eoi + 2])
                     _LOGGER.debug(
                         "Snapshot extracted %sB from %s",
                         len(jpeg),

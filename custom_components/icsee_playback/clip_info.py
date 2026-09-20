@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import json
 import time
-from datetime import timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -85,12 +84,6 @@ def signed_play_path(
     if normalize_play_mode(mode) == PLAY_MODE_BRIDGE:
         path = f"{path}&mode={PLAY_MODE_BRIDGE}"
     expires = int(time.time()) + PLAY_TTL_SEC
-    try:
-        from homeassistant.components.http.auth import async_sign_path
-
-        path = async_sign_path(hass, path, timedelta(hours=1))
-    except Exception:  # noqa: BLE001
-        pass
     return path, expires
 
 
@@ -101,12 +94,6 @@ def clip_dict(hass: HomeAssistant, entry_id: str, item: dict[str, Any]) -> dict[
     end = str(item.get("EndTime") or "")
     play_path, expires = signed_play_path(hass, entry_id, filename, begin, end)
     thumb_path = signed_thumb_url(hass, entry_id, filename, begin, end)
-    try:
-        from homeassistant.components.http.auth import async_sign_path
-
-        thumb_path = async_sign_path(hass, thumb_path, timedelta(days=7))
-    except Exception:  # noqa: BLE001
-        pass
     if photo:
         bridge_path = play_path
     else:

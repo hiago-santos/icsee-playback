@@ -14,6 +14,7 @@ from .api import IcseeCamerasView, IcseeClipsView, IcseeStopView
 from .const import DOMAIN
 from .helper import CameraRuntime
 from .hls import stop_playback_for_entry
+from .play_auth import async_load_secret
 from .views import IcseeHlsView, IcseePlaybackView, IcseeThumbView
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ async def async_setup(hass: HomeAssistant, _config: dict) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up one camera from a config entry."""
     _ensure_store(hass)
+    await async_load_secret(hass)
     await hass.async_add_executor_job(_purge_legacy_thumb_cache, hass)
     runtime = CameraRuntime(hass, entry)
     hass.data[DOMAIN]["entries"][entry.entry_id] = runtime

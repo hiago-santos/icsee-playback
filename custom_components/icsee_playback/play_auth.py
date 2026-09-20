@@ -14,6 +14,26 @@ from .const import DOMAIN
 
 PLAY_TTL_SEC = 3600
 THUMB_TTL_SEC = 7 * 86400
+SECRET_STORAGE_VERSION = 1
+SECRET_STORAGE_KEY = f"{DOMAIN}_secret"
+
+
+async def async_load_secret(hass: HomeAssistant) -> None:
+    """Keep the HMAC key across restarts so listed clip URLs stay valid."""
+    from homeassistant.helpers.storage import Store
+
+    store = Store(hass, SECRET_STORAGE_VERSION, SECRET_STORAGE_KEY)
+    data = await store.async_load()
+    raw = data.get("key") if isinstance(data, dict) else None
+    if isinstance(raw, str) and len(raw) >= 32:
+        try:
+            hass.data[DOMAIN]["secret"] = bytes.fromhex(raw)
+            return
+        except ValueError:
+            pass
+    secret = secrets.token_bytes(32)
+    hass.data[DOMAIN]["secret"] = secret
+    await store.async_save({"key": secret.hex()})
 
 
 def ensure_secret(hass: HomeAssistant) -> bytes:
@@ -77,19 +97,22 @@ def signed_thumb_url(
     return f"/api/icsee_playback/{entry_id}/thumb?{query}"
 
 
-def verify_play_query(hass: HomeAssistant, entry_id: str, query) -> bool:
+def verify_play_query(hass: HomeAssistant, entry_id: str, query) -> str | None:
+    """None if the HMAC is valid. Otherwise a short reason for the log."""
     filename = query.get("filename")
     start = query.get("start")
     end = query.get("end")
     exp_raw = query.get("exp")
     sig = query.get("sig")
     if not filename or not start or not end or not exp_raw or not sig:
-        return False
+        return "campos faltando"
     try:
         exp = int(exp_raw)
     except (TypeError, ValueError):
-        return False
+        return "exp inválido"
     if exp < int(time.time()):
-        return False
+        return "link expirado"
     expected = _signature(hass, entry_id, filename, start, end, exp)
-    return hmac.compare_digest(expected, sig)
+    if not hmac.compare_digest(expected, sig):
+        return "HMAC não confere"
+    return None

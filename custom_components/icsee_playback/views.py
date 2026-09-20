@@ -47,15 +47,16 @@ class IcseePlaybackView(HomeAssistantView):
 
     async def get(self, request: web.Request, entry_id: str) -> web.StreamResponse:
         hass: HomeAssistant = request.app["hass"]
-        if not verify_play_query(hass, entry_id, request.query) and request.get(
-            "hass_user"
-        ) is None:
+        motivo = verify_play_query(hass, entry_id, request.query)
+        if motivo is not None and request.get("hass_user") is None:
             _LOGGER.warning(
-                "Rejected play (invalid sig) entry=%s keys=%s",
+                "Rejected play (%s) entry=%s keys=%s",
+                motivo,
                 entry_id,
                 list(request.query.keys()),
             )
-            raise web.HTTPUnauthorized(text="Invalid or expired playback link")
+            # 403, não 401: o Core trata 401 como "login inválido".
+            raise web.HTTPForbidden(text="Invalid or expired playback link")
 
         runtime = hass.data.get(DOMAIN, {}).get("entries", {}).get(entry_id)
         if runtime is None:
@@ -197,10 +198,9 @@ class IcseeThumbView(HomeAssistantView):
 
     async def get(self, request: web.Request, entry_id: str) -> web.StreamResponse:
         hass: HomeAssistant = request.app["hass"]
-        if not verify_play_query(hass, entry_id, request.query) and request.get(
-            "hass_user"
-        ) is None:
-            raise web.HTTPUnauthorized(text="Invalid or expired thumbnail link")
+        motivo = verify_play_query(hass, entry_id, request.query)
+        if motivo is not None and request.get("hass_user") is None:
+            raise web.HTTPForbidden(text="Invalid or expired thumbnail link")
 
         runtime = hass.data.get(DOMAIN, {}).get("entries", {}).get(entry_id)
         if runtime is None:

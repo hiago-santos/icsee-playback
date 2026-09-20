@@ -20,6 +20,7 @@ from .const import (
     CONF_CHANNEL,
     DEFAULT_CHANNEL,
     DEFAULT_PORT,
+    PLAY_STALE_SECONDS,
     THUMB_WORKERS,
 )
 from .dvrip import (
@@ -50,9 +51,12 @@ class PlayBusy(Exception):
 
 
 def _clip_span_key(item: dict[str, Any]) -> tuple:
+    """Same recording, listed twice. Vídeo: o início já basta como identidade."""
     name = str(item.get("FileName") or "").lower()
     photo = name.endswith((".jpg", ".jpeg"))
-    return (item.get("BeginTime"), item.get("EndTime"), photo)
+    if photo:
+        return (item.get("BeginTime"), item.get("EndTime"), True)
+    return (item.get("BeginTime"), False)
 
 
 def _clip_name_rank(item: dict[str, Any]) -> int:
@@ -60,6 +64,14 @@ def _clip_name_rank(item: dict[str, Any]) -> int:
     if name.endswith((".h264", ".mp4", ".jpg", ".jpeg")):
         return 2
     return 1
+
+
+def _clip_beats_duplicate(item: dict[str, Any], prev: dict[str, Any]) -> bool:
+    rank = _clip_name_rank(item)
+    prev_rank = _clip_name_rank(prev)
+    if rank != prev_rank:
+        return rank > prev_rank
+    return str(item.get("EndTime") or "") > str(prev.get("EndTime") or "")
 
 
 def _map_thumb_error(err: Exception) -> Exception:
@@ -355,6 +367,7 @@ class CameraRuntime:
         self._query_lock = threading.Lock()
         self._ctrl = threading.Lock()
         self._gen = 0
+        self._play_beat = 0.0
         self._active_stop: threading.Event | None = None
         self._cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._proc = None
@@ -471,10 +484,10 @@ class CameraRuntime:
             self._query_lock.release()
         by_span: dict[tuple, dict[str, Any]] = {}
         for item in by_name.values():
-            key = _clip_span_key(item)
-            prev = by_span.get(key)
-            if prev is None or _clip_name_rank(item) > _clip_name_rank(prev):
-                by_span[key] = item
+            span = _clip_span_key(item)
+            prev = by_span.get(span)
+            if prev is None or _clip_beats_duplicate(item, prev):
+                by_span[span] = item
         files = sorted(
             by_span.values(),
             key=lambda item: item.get("BeginTime") or "",
@@ -528,6 +541,7 @@ class CameraRuntime:
             out_queue.put(PlayBusy("A câmera já está em playback."))
             out_queue.put(None)
             return
+        self._play_beat = time.monotonic()
         self.interrupt_all_thumbs()
         self._thumb_pool.discard_idle()
         if stop.is_set() or my_gen != self._gen:
@@ -636,6 +650,20 @@ class CameraRuntime:
             assert proc.stdout is not None
             pending = bytearray()
             sent_header = False
+            stalled = 0
+
+            def hand_over(payload: bytes) -> bool:
+                """Passa bytes ao cliente. False = ninguém está lendo mais."""
+                nonlocal stalled
+                try:
+                    out_queue.put(payload, timeout=8)
+                except queue.Full:
+                    stalled += 1
+                    return stalled < 3
+                stalled = 0
+                self._play_beat = time.monotonic()
+                return True
+
             while not stop.is_set():
                 data = proc.stdout.read(64 * 1024)
                 if not data:
@@ -646,22 +674,22 @@ class CameraRuntime:
                         _LOGGER.warning(
                             "Playback ffmpeg init segment %sB", len(pending)
                         )
-                        out_queue.put(bytes(pending))
-                        pending.clear()
-                        sent_header = True
                     elif len(pending) > 2_000_000:
                         _LOGGER.warning(
                             "Playback ffmpeg oversized buffer %sB", len(pending)
                         )
-                        out_queue.put(bytes(pending))
-                        pending.clear()
-                        sent_header = True
-                    continue
-                try:
-                    out_queue.put(data, timeout=8)
-                except queue.Full:
-                    if stop.is_set():
+                    else:
+                        continue
+                    if not hand_over(bytes(pending)):
                         break
+                    pending.clear()
+                    sent_header = True
+                    continue
+                if not hand_over(data):
+                    # Cliente sumiu ou está parado: soltar a câmera vale mais
+                    # do que guardar o clipe, senão as miniaturas nunca voltam.
+                    _LOGGER.warning("Playback sem leitor, encerrando %s", filename)
+                    break
             feeder.join(timeout=2)
             if not sent_header:
                 out_queue.put(
@@ -693,8 +721,12 @@ class CameraRuntime:
                 pass
             if dvr:
                 dvr.close()
+            self._play_beat = 0.0
             self.lock.release()
-            out_queue.put(None)
+            try:
+                out_queue.put(None, timeout=5)
+            except queue.Full:
+                pass
 
     def _bind_thumb(self, stop: threading.Event, dvr: DVRIP) -> None:
         with self._thumb_guard:
@@ -711,6 +743,24 @@ class CameraRuntime:
             dvr = self._thumb_live.pop(id(stop), None)
         if dvr is not None:
             dvr.interrupt()
+
+    def playback_active(self) -> bool:
+        """True while a playback holds the camera *and* is still moving bytes.
+
+        The lock alone is not enough: a client that goes away mid-clip used to
+        leave it taken forever, and then every thumbnail got a 409 on the spot.
+        """
+        if not self.lock.locked():
+            return False
+        beat = self._play_beat
+        return bool(beat) and (time.monotonic() - beat) < PLAY_STALE_SECONDS
+
+    def release_stale_playback(self) -> None:
+        """Kill a playback nobody is reading so the camera comes back."""
+        if not self.lock.locked() or self.playback_active():
+            return
+        _LOGGER.warning("Playback parado sem leitor: liberando a câmera")
+        self.abort()
 
     def interrupt_all_thumbs(self) -> None:
         """Playback is starting: drop in-flight thumbnail sockets."""
@@ -790,7 +840,8 @@ class CameraRuntime:
             raise RuntimeError("Miniatura ocupada")
 
         try:
-            if self.lock.locked():
+            self.release_stale_playback()
+            if self.playback_active():
                 raise PlayBusy("A câmera já está em playback.")
             deadline = time.monotonic() + 8
             while not self._thumb_slots.acquire(timeout=0.15):

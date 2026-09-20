@@ -26,6 +26,7 @@ from .const import (
 from .dvrip import (
     DVRIP,
     annexb_has_keyframe,
+    annexb_has_params,
     format_camera_time,
     parse_camera_time,
     prepare_video_es,
@@ -196,13 +197,20 @@ def normalize_play_mode(raw: str | None) -> str:
 
 
 def apply_play_seek(start: str, end: str, t_raw: str | None) -> str:
-    """Move BeginTime forward by t seconds so the app can scrub the clip."""
+    """Move BeginTime forward by t seconds so the app can scrub the clip.
+
+    The camera GOP is typically 2s. Seeking to an arbitrary second lands in
+    the middle of a GOP (P-frames, no VPS/SPS/PPS) and ffmpeg copy dies.
+    Snap down to 2s so Claim is more likely to start on an I-frame; the
+    reader still skips until parameter sets + keyframe anyway.
+    """
     try:
         offset = int(float(t_raw or "0"))
     except (TypeError, ValueError):
         return start
     if offset <= 0:
         return start
+    offset = (offset // 2) * 2
     try:
         begin = parse_camera_time(start)
         finish = parse_camera_time(end)
@@ -219,8 +227,14 @@ def apply_play_seek(start: str, end: str, t_raw: str | None) -> str:
     return format_camera_time(sought)
 
 
-def ffmpeg_cmd(binary: str, codec: str, mode: str = PLAY_MODE_TRANSCODE) -> list[str]:
+def ffmpeg_cmd(
+    binary: str,
+    codec: str,
+    mode: str = PLAY_MODE_TRANSCODE,
+    fps: int | None = None,
+) -> list[str]:
     fmt = "hevc" if codec == "hevc" else "h264"
+    rate = str(int(fps) if fps and fps > 0 else 12)
     common = [
         binary,
         "-hide_banner",
@@ -232,9 +246,13 @@ def ffmpeg_cmd(binary: str, codec: str, mode: str = PLAY_MODE_TRANSCODE) -> list
         "ignore_err",
         "-f",
         fmt,
+        "-r",
+        rate,
         "-i",
         "pipe:0",
         "-an",
+        "-avoid_negative_ts",
+        "make_zero",
     ]
     mux = [
         "-movflags",
@@ -257,6 +275,48 @@ def ffmpeg_cmd(binary: str, codec: str, mode: str = PLAY_MODE_TRANSCODE) -> list
             "zerolatency",
         ]
     return cmd
+
+
+def take_playable_start(stream, stop: threading.Event | None = None):
+    """Skip until VPS/SPS/PPS and an I-frame so ffmpeg copy can mux.
+
+    After a seek the camera often starts mid-GOP (tiny 0x1FD packets, no
+    dimensions, PPS id out of range). Feeding that to ffmpeg is what produced
+    'encerrou sem gerar MP4'. Drop those bytes and start at the next IDR.
+    """
+    buf = bytearray()
+    demuxer = None
+    chunks = 0
+    for es, demuxer in stream:
+        if stop is not None and stop.is_set():
+            raise PlaySuperseded("Playback substituído por outro pedido.")
+        chunks += 1
+        if es:
+            buf.extend(es)
+        codec = (demuxer.codec if demuxer is not None else None) or "hevc"
+        prepared = prepare_video_es(bytes(buf), codec)
+        if annexb_has_params(prepared, codec) and annexb_has_keyframe(prepared, codec):
+            skipped = max(0, len(buf) - len(prepared))
+            if skipped:
+                _LOGGER.warning(
+                    "Playback skipped %sB until keyframe (%s chunks)",
+                    skipped,
+                    chunks,
+                )
+            return prepared, demuxer
+        if chunks >= 80 or len(buf) >= 2_500_000:
+            break
+    if not buf:
+        raise RuntimeError("A câmera não enviou dados do clipe.")
+    codec = (demuxer.codec if demuxer is not None else None) or "hevc"
+    prepared = prepare_video_es(bytes(buf), codec)
+    if not prepared:
+        raise RuntimeError("Clipe sem NAL de vídeo reconhecível.")
+    if not annexb_has_params(prepared, codec):
+        raise RuntimeError(
+            "A câmera não enviou um quadro-chave decodificável neste ponto do clipe."
+        )
+    return prepared, demuxer
 
 
 def get_ffmpeg_binary(hass: HomeAssistant) -> str:
@@ -584,30 +644,20 @@ class CameraRuntime:
             with self._ctrl:
                 self._play_dvr = dvr
             stream = dvr.iter_file_stream(file_info)
-            try:
-                first_es, demuxer = next(stream)
-            except StopIteration as err:
-                raise RuntimeError("A câmera não enviou dados do clipe.") from err
-            if not first_es:
-                raise RuntimeError("Clipe vazio na câmera.")
+            first_es, demuxer = take_playable_start(stream, stop)
             codec = demuxer.codec or "hevc"
-            trimmed = prepare_video_es(first_es, codec)
             _LOGGER.warning(
-                "Playback stream codec=%s %sx%s@%s first=%sB trim=%sB head=%s file=%s",
+                "Playback stream codec=%s %sx%s@%s first=%sB head=%s file=%s",
                 codec,
                 demuxer.width,
                 demuxer.height,
                 demuxer.fps,
                 len(first_es),
-                len(trimmed),
-                trimmed[:24].hex(),
+                first_es[:24].hex(),
                 filename,
             )
-            first_es = trimmed
-            if not first_es:
-                raise RuntimeError("Clipe sem NAL de vídeo reconhecível.")
 
-            cmd = ffmpeg_cmd(ffmpeg_bin, codec, mode)
+            cmd = ffmpeg_cmd(ffmpeg_bin, codec, mode, fps=demuxer.fps)
             _LOGGER.warning("ffmpeg mode=%s cmd: %s", mode, " ".join(cmd))
             proc = subprocess.Popen(
                 cmd,
@@ -656,6 +706,16 @@ class CameraRuntime:
                             proc.stdin.write(chunk)
                     if proc.stdin:
                         proc.stdin.close()
+                except (BrokenPipeError, ConnectionError, OSError) as err:
+                    if stop.is_set():
+                        _LOGGER.debug("Playback feed stopped: %s", err)
+                    else:
+                        _LOGGER.warning("Playback feed failed: %s", err)
+                    try:
+                        if proc.stdin:
+                            proc.stdin.close()
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception as err:  # noqa: BLE001
                     _LOGGER.warning("Playback feed failed: %s", err)
                     try:

@@ -204,8 +204,8 @@ def _length_prefixed_to_annexb(data: bytes) -> bytes | None:
     return bytes(out)
 
 
-def annexb_has_keyframe(data: bytes, codec: str) -> bool:
-    """True once the Annex-B buffer includes an IDR/CRA (enough for one JPEG)."""
+def _annexb_nal_types(data: bytes, codec: str) -> set[int]:
+    seen: set[int] = set()
     i = 0
     n = len(data)
     hevc = codec == "hevc"
@@ -220,13 +220,25 @@ def annexb_has_keyframe(data: bytes, codec: str) -> bool:
         if start >= n:
             break
         nal = data[start]
-        if hevc:
-            if (nal >> 1) & 0x3F in (19, 20, 21):
-                return True
-        elif nal & 0x1F == 5:
-            return True
+        seen.add((nal >> 1) & 0x3F if hevc else nal & 0x1F)
         i = start + 1
-    return False
+    return seen
+
+
+def annexb_has_params(data: bytes, codec: str) -> bool:
+    """True when the buffer includes the parameter sets ffmpeg needs to decode."""
+    types = _annexb_nal_types(data, codec)
+    if codec == "hevc":
+        return 32 in types and 33 in types and 34 in types
+    return 7 in types and 8 in types
+
+
+def annexb_has_keyframe(data: bytes, codec: str) -> bool:
+    """True once the Annex-B buffer includes an IDR/CRA (enough for one JPEG)."""
+    types = _annexb_nal_types(data, codec)
+    if codec == "hevc":
+        return bool(types & {19, 20, 21})
+    return 5 in types
 
 
 class DVRIP:
@@ -276,9 +288,12 @@ class DVRIP:
         return f"0x{self.session:08X}"
 
     def recv_exact(self, size):
+        sock = self.sock
+        if sock is None:
+            raise ConnectionError("A conexão com a câmera foi interrompida.")
         data = b""
         while len(data) < size:
-            chunk = self.sock.recv(size - len(data))
+            chunk = sock.recv(size - len(data))
             if not chunk:
                 raise ConnectionError("A câmera fechou a conexão.")
             data += chunk
@@ -297,6 +312,9 @@ class DVRIP:
         ).encode("utf-8")
 
     def send_packet(self, message_id, payload=None, include_session=True):
+        sock = self.sock
+        if sock is None:
+            raise ConnectionError("A conexão com a câmera foi interrompida.")
         data = self._encode_payload(payload, include_session=include_session)
         header = struct.pack(
             "BB2xII2xHI",
@@ -307,7 +325,7 @@ class DVRIP:
             message_id,
             len(data) + 2,
         )
-        self.sock.sendall(header + data + b"\x0a\x00")
+        sock.sendall(header + data + b"\x0a\x00")
         self.packet_count += 1
 
     def recv_packet(self):
@@ -489,7 +507,7 @@ class DVRIP:
                     1420,
                     self.playback_payload("DownloadStop", file_info),
                 )
-            except OSError:
+            except (OSError, ConnectionError):
                 pass
 
     def iter_raw_download(self, file_info, timeout=12):
@@ -525,5 +543,5 @@ class DVRIP:
                     1420,
                     self.playback_payload("DownloadStop", file_info),
                 )
-            except OSError:
+            except (OSError, ConnectionError):
                 pass

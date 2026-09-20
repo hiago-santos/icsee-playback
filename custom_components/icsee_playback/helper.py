@@ -340,6 +340,23 @@ def ffmpeg_hls_cmd(
     return cmd
 
 
+def offer(out_queue: queue.Queue, item: Any, timeout: float = 5.0) -> bool:
+    """Put on the client queue without ever blocking forever.
+
+    A `put()` with no timeout is a camera lock that never comes back: when the
+    HTTP client goes away the queue stays full, the producer thread parks on the
+    put while still holding the lock, and from then on every playback and every
+    thumbnail answers 409 until Home Assistant restarts.
+    """
+    try:
+        out_queue.put(item, timeout=timeout)
+        return True
+    except queue.Full:
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def validate_login(host: str, port: int, username: str, password: str) -> str:
     """Try DVRIP login. Returns camera clock or raises."""
     dvr = DVRIP(host, port, timeout=12)
@@ -537,17 +554,27 @@ class CameraRuntime:
         if old_dvr is not None:
             old_dvr.interrupt()
 
+        # O pedido anterior já foi mandado embora acima; se a trava ainda está
+        # de pé é porque ninguém lê aquele playback — solta antes de desistir.
+        self.release_stale_playback()
         if not self.lock.acquire(timeout=8):
-            out_queue.put(PlayBusy("A câmera já está em playback."))
-            out_queue.put(None)
-            return
+            self.release_stale_playback()
+            if not self.lock.acquire(timeout=8):
+                _LOGGER.warning(
+                    "Playback busy: lock held, last beat %.1fs ago",
+                    time.monotonic() - self._play_beat if self._play_beat else -1,
+                )
+                offer(out_queue, PlayBusy("A câmera já está em playback."))
+                offer(out_queue, None)
+                return
         self._play_beat = time.monotonic()
         self.interrupt_all_thumbs()
         self._thumb_pool.discard_idle()
         if stop.is_set() or my_gen != self._gen:
+            self._play_beat = 0.0
             self.lock.release()
-            out_queue.put(PlaySuperseded("Playback substituído por outro pedido."))
-            out_queue.put(None)
+            offer(out_queue, PlaySuperseded("Playback substituído por outro pedido."))
+            offer(out_queue, None)
             return
 
         try:
@@ -655,9 +682,7 @@ class CameraRuntime:
             def hand_over(payload: bytes) -> bool:
                 """Passa bytes ao cliente. False = ninguém está lendo mais."""
                 nonlocal stalled
-                try:
-                    out_queue.put(payload, timeout=8)
-                except queue.Full:
+                if not offer(out_queue, payload, timeout=8):
                     stalled += 1
                     return stalled < 3
                 stalled = 0
@@ -692,17 +717,15 @@ class CameraRuntime:
                     break
             feeder.join(timeout=2)
             if not sent_header:
-                out_queue.put(
+                offer(
+                    out_queue,
                     RuntimeError(
                         "ffmpeg encerrou sem gerar MP4 (veja as linhas ffmpeg no log)"
-                    )
+                    ),
                 )
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception("Playback failed")
-            try:
-                out_queue.put(err)
-            except Exception:  # noqa: BLE001
-                pass
+            offer(out_queue, err)
         finally:
             stop.set()
             if proc:
@@ -723,10 +746,7 @@ class CameraRuntime:
                 dvr.close()
             self._play_beat = 0.0
             self.lock.release()
-            try:
-                out_queue.put(None, timeout=5)
-            except queue.Full:
-                pass
+            offer(out_queue, None)
 
     def _bind_thumb(self, stop: threading.Event, dvr: DVRIP) -> None:
         with self._thumb_guard:
